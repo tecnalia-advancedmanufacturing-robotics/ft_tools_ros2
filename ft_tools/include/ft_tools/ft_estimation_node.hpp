@@ -19,6 +19,7 @@
 
 #include <string>
 #include <memory>
+#include <unordered_map>
 
 #include "ft_tools/ft_estimation.hpp"
 #include "ft_tools/joint_state_monitor.hpp"
@@ -77,6 +78,15 @@ protected:
 
   bool init_kinematics_monitoring();
 
+  /// Links that hang off the base→tip chain (fixed joints only) are expressed
+  /// as a constant offset from the nearest chain link.
+  bool register_off_chain_frames();
+
+  bool calculate_frame_transform(
+    const Eigen::VectorXd & joint_pos,
+    const std::string & link_name,
+    Eigen::Isometry3d & transform);
+
   // Parameters management
   std::shared_ptr<ft_estimation_node::ParamListener> parameter_handler_;
   ft_estimation_node::Params parameters_;
@@ -127,6 +137,13 @@ protected:
 
   /// Kinematics interface
   std::unique_ptr<kinematics_interface::KinematicsInterface> kinematics_;
+
+  struct OffChainLink
+  {
+    std::string anchor;
+    Eigen::Isometry3d offset;
+  };
+  std::unordered_map<std::string, OffChainLink> off_chain_links_;
 
   // Services
   rclcpp::Service<ft_msgs::srv::SetCalibration>::SharedPtr srv_set_calibration_;

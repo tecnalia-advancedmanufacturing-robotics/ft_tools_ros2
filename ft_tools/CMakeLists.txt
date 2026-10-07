@@ -7,6 +7,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(generate_parameter_library REQUIRED)
+find_package(kdl_parser REQUIRED)
 
 # TODO(tpoignone): split in deps lib / deps nodes...
 set(DEPENDENCIES
@@ -88,7 +89,7 @@ add_executable(ft_estimation_node
   src/ft_estimation_node.cpp
   src/joint_state_monitor.cpp
 )
-ament_target_dependencies(ft_estimation_node PUBLIC ${DEPENDENCIES} generate_parameter_library)
+ament_target_dependencies(ft_estimation_node PUBLIC ${DEPENDENCIES} kdl_parser generate_parameter_library)
 target_include_directories(ft_estimation_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>

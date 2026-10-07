@@ -15,11 +15,15 @@
 // Author: Thibault Poignonec (thibault.poignonec@gmail.com)
 
 # include <cmath>
+#include <unordered_set>
+
 #include "ft_tools/ft_estimation_node.hpp"
 #include "ft_tools/msgs_conversion.hpp"
 
 #include "tf2_eigen/tf2_eigen.hpp"
 #include <tf2_eigen_kdl/tf2_eigen_kdl.hpp>
+#include "kdl_parser/kdl_parser.hpp"
+#include "kdl/tree.hpp"
 
 using std::placeholders::_1;
 using std::placeholders::_2;
@@ -38,9 +42,9 @@ FtEstimationNode::FtEstimationNode()
   );
   parameters_ = parameter_handler_->get_params();
   all_ok &= update_parameters(true);  // forced update
-  all_ok &= init_kinematics_monitoring();
 
-  // Retrieve reference, sensor, and interaction frames
+  // Retrieve reference, sensor, and interaction frames before kinematics init
+  // so off-chain links can be resolved against the base→tip chain.
   reference_frame_ = parameters_.calibration.reference_frame.id;
   RCLCPP_INFO(this->get_logger(), "'reference frame' : %s", reference_frame_.c_str());
   sensor_frame_ = parameters_.calibration.sensor_frame.id;
@@ -50,6 +54,8 @@ FtEstimationNode::FtEstimationNode()
   if (interaction_frame_.empty()) {
     interaction_frame_ = sensor_frame_;
   }
+
+  all_ok &= init_kinematics_monitoring();
 
   // Init wrench estimator
   FtParameters ft_calib_parameters;
@@ -145,19 +151,19 @@ bool FtEstimationNode::update_robot_state()
   );
 
   // Update sensor pose and twist w.r.t. robot base
-  success &= kinematics_->calculate_link_transform(
+  success &= calculate_frame_transform(
     joint_pos,
     sensor_frame_,
     sensor_frame_wrt_robot_base_
   );
   // Update interaction frame w.r.t. robot base
-  success &= kinematics_->calculate_link_transform(
+  success &= calculate_frame_transform(
     joint_pos,
     interaction_frame_,
     interaction_frame_wrt_robot_base_
   );
   // Update reference pose w.r.t. robot base
-  success &= kinematics_->calculate_link_transform(
+  success &= calculate_frame_transform(
     joint_pos,
     reference_frame_,
     ref_frame_wrt_robot_base_
@@ -183,7 +189,7 @@ void FtEstimationNode::callback_new_raw_wrench(
     last_msg_raw_wrench_ = msg_raw_wrench;
   }
   bool success = process_new_raw_wrench(msg_raw_wrench);
-  last_estimate_ok_ = success;
+  last_estimate_ok_ = success;ph
   if (is_first_wrench_ && success) {
     is_first_wrench_ = false;
   }
@@ -328,6 +334,10 @@ bool FtEstimationNode::init_kinematics_monitoring()
     parameters_.topic_joint_state);
 
   if (all_ok) {
+    all_ok &= register_off_chain_frames();
+  }
+
+  if (all_ok) {
     // Create raw wrench subscriber
     raw_wrench_subscriber_ =
       this->create_subscription<geometry_msgs::msg::WrenchStamped>(
@@ -340,6 +350,124 @@ bool FtEstimationNode::init_kinematics_monitoring()
       "Failed to init the wrench estimator! Make sure the config and urdf files are correct.");
   }
   return all_ok;
+}
+
+bool FtEstimationNode::register_off_chain_frames()
+{
+  auto robot_param = rclcpp::Parameter();
+  if (!this->get_parameter("robot_description", robot_param)) {
+    RCLCPP_ERROR(this->get_logger(), "parameter robot_description not set");
+    return false;
+  }
+  KDL::Tree tree;
+  if (!kdl_parser::treeFromString(robot_param.as_string(), tree)) {
+    RCLCPP_ERROR(this->get_logger(), "Failed to parse robot_description into a KDL tree");
+    return false;
+  }
+
+  const std::string & base = parameters_.kinematics.base;
+  const std::string & tip = parameters_.kinematics.tip;
+  KDL::Chain chain;
+  if (!tree.getChain(base, tip, chain)) {
+    RCLCPP_ERROR(
+      this->get_logger(),
+      "Failed to build the kinematics chain from '%s' to '%s'",
+      base.c_str(), tip.c_str());
+    return false;
+  }
+  std::unordered_set<std::string> chain_links;
+  chain_links.insert(base);
+  for (unsigned int i = 0; i < chain.getNrOfSegments(); ++i) {
+    chain_links.insert(chain.getSegment(i).getName());
+  }
+
+  const auto & segments = tree.getSegments();
+  auto register_frame = [&](const std::string & frame) -> bool {
+      if (frame.empty() || chain_links.count(frame) || off_chain_links_.count(frame)) {
+        return true;
+      }
+      if (tree.getSegment(frame) == segments.end()) {
+        RCLCPP_ERROR(
+          this->get_logger(), "Link '%s' is not in the robot description", frame.c_str());
+        return false;
+      }
+
+      std::string anchor;
+      std::string current = frame;
+      for (size_t i = 0; i < segments.size(); ++i) {
+        const auto it = tree.getSegment(current);
+        if (it == segments.end() || it == tree.getRootSegment()) {
+          break;
+        }
+        const auto parent_it = it->second.parent;
+        if (parent_it == segments.end()) {
+          break;
+        }
+        if (chain_links.count(parent_it->first)) {
+          anchor = parent_it->first;
+          break;
+        }
+        current = parent_it->first;
+      }
+      if (anchor.empty()) {
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "Link '%s' is not connected to the kinematics chain '%s' -> '%s'",
+          frame.c_str(), base.c_str(), tip.c_str());
+        return false;
+      }
+
+      KDL::Chain branch;
+      if (!tree.getChain(anchor, frame, branch)) {
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "Failed to connect link '%s' to chain link '%s'",
+          frame.c_str(), anchor.c_str());
+        return false;
+      }
+      KDL::Frame pose = KDL::Frame::Identity();
+      for (unsigned int i = 0; i < branch.getNrOfSegments(); ++i) {
+        const KDL::Segment & segment = branch.getSegment(i);
+        if (segment.getJoint().getType() != KDL::Joint::Fixed) {
+          RCLCPP_ERROR(
+            this->get_logger(),
+            "Link '%s' is off the kinematics chain, and joint '%s' between '%s' and '%s' is not fixed",
+            frame.c_str(), segment.getJoint().getName().c_str(), anchor.c_str(), frame.c_str());
+          return false;
+        }
+        pose = pose * segment.pose(0.0);
+      }
+
+      Eigen::Isometry3d offset;
+      tf2::transformKDLToEigen(pose, offset);
+      off_chain_links_[frame] = OffChainLink{anchor, offset};
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Link '%s' is not on the kinematics chain; using the fixed transform from '%s'",
+        frame.c_str(), anchor.c_str());
+      return true;
+    };
+
+  return register_frame(reference_frame_) &&
+         register_frame(sensor_frame_) &&
+         register_frame(interaction_frame_);
+}
+
+bool FtEstimationNode::calculate_frame_transform(
+  const Eigen::VectorXd & joint_pos,
+  const std::string & link_name,
+  Eigen::Isometry3d & transform)
+{
+  const auto it = off_chain_links_.find(link_name);
+  if (it == off_chain_links_.end()) {
+    return kinematics_->calculate_link_transform(joint_pos, link_name, transform);
+  }
+  Eigen::Isometry3d anchor_tf;
+  if (!kinematics_->calculate_link_transform(joint_pos, it->second.anchor, anchor_tf)) {
+    return false;
+  }
+  transform = anchor_tf * it->second.offset;
+  return true;
 }
 
 bool FtEstimationNode::register_services()
