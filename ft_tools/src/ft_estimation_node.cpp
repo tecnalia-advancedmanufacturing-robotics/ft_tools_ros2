@@ -189,7 +189,11 @@ void FtEstimationNode::callback_new_raw_wrench(
     last_msg_raw_wrench_ = msg_raw_wrench;
   }
   bool success = process_new_raw_wrench(msg_raw_wrench);
-  last_estimate_ok_ = success;ph
+  last_estimate_ok_ = success;
+  if (success && bias_collecting_) {
+    bias_sum_ += ft_estimation_process_.get_estimated_wrench();
+    ++bias_count_;
+  }
   if (is_first_wrench_ && success) {
     is_first_wrench_ = false;
   }
@@ -578,25 +582,47 @@ void FtEstimationNode::save_calibration(
 }
 
 void FtEstimationNode::bias(
-  const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
-  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+  const std::shared_ptr<rmw_request_id_t> request_header,
+  const std::shared_ptr<std_srvs::srv::Trigger::Request> request)
 {
   (void)request;
-  if (!last_estimate_ok_) {
-    response->success = false;
-    response->message = "No valid gravity-compensated wrench yet";
+  if (bias_collecting_) {
+    std_srvs::srv::Trigger::Response response;
+    response.success = false;
+    response.message = "Bias already in progress";
+    srv_bias_->send_response(*request_header, response);
     return;
   }
-  const double age = (this->get_clock()->now() - last_msg_raw_wrench_.header.stamp).seconds();
-  if (age > 1.0) {
-    response->success = false;
-    response->message = "Estimated wrench is stale";
+  bias_sum_.setZero();
+  bias_count_ = 0;
+  bias_collecting_ = true;
+  bias_request_id_ = *request_header;
+  RCLCPP_INFO(this->get_logger(), "Bias: collecting wrench estimates for 1s");
+  // ponytail: fixed 1s; make it a parameter if this sensor needs a longer average.
+  bias_timer_ = this->create_wall_timer(1s, std::bind(&FtEstimationNode::finish_bias, this));
+}
+
+void FtEstimationNode::finish_bias()
+{
+  bias_timer_->cancel();
+  bias_collecting_ = false;
+  std_srvs::srv::Trigger::Response response;
+  const std::size_t sample_count = bias_count_;
+  if (sample_count < 5) {
+    bias_sum_.setZero();
+    bias_count_ = 0;
+    response.success = false;
+    response.message = "Not enough wrench samples during the 1s bias window";
+    srv_bias_->send_response(bias_request_id_, response);
     return;
   }
 
-  // estimated = raw - gravity - offset, so adding the residual cancels the drift.
+  // estimated = raw - gravity - offset, so adding the mean residual cancels the drift.
+  const Eigen::Matrix<double, 6, 1> residual =
+    bias_sum_ / static_cast<double>(sample_count);
+  bias_sum_.setZero();
+  bias_count_ = 0;
   FtParameters ft_calib_parameters = ft_estimation_process_.get_ft_calibration();
-  const Eigen::Matrix<double, 6, 1> residual = ft_estimation_process_.get_estimated_wrench();
   ft_calib_parameters.force_offset += residual.head(3);
   ft_calib_parameters.torque_offset += residual.tail(3);
   ft_estimation_process_.set_parameters(
@@ -609,16 +635,18 @@ void FtEstimationNode::bias(
       parameters_.calibration.calibration_filename,
       parameters_.calibration.calibration_package))
   {
-    response->success = false;
-    response->message = "Offsets updated in memory, but saving the yaml file failed";
-    return;
+    response.success = false;
+    response.message = "Offsets updated in memory, but saving the yaml file failed";
+  } else {
+    response.success = true;
+    response.message = "Added the averaged sensor-frame residual to force_offset and torque_offset";
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Bias trim over %zu samples [%f, %f, %f, %f, %f, %f]",
+      sample_count,
+      residual[0], residual[1], residual[2], residual[3], residual[4], residual[5]);
   }
-  response->success = true;
-  response->message = "Added the current sensor-frame residual to force_offset and torque_offset";
-  RCLCPP_INFO(
-    this->get_logger(),
-    "Bias trim [%f, %f, %f, %f, %f, %f]",
-    residual[0], residual[1], residual[2], residual[3], residual[4], residual[5]);
+  srv_bias_->send_response(bias_request_id_, response);
 }
 
 void FtEstimationNode::reload_calibration(

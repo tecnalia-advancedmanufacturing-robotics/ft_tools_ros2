@@ -70,10 +70,12 @@ public:
     std::shared_ptr<std_srvs::srv::Trigger::Response> response);
 
   void bias(
-    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
-    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+    const std::shared_ptr<rmw_request_id_t> request_header,
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request);
 
 protected:
+  void finish_bias();
+
   bool register_services();
 
   bool init_kinematics_monitoring();
@@ -104,6 +106,13 @@ protected:
   bool is_first_wrench_ = true;
   bool last_estimate_ok_ = false;
   Eigen::Matrix<double, 6, 1> last_interaction_wrench_;
+
+  // Filled only while a bias call is in progress.
+  bool bias_collecting_ = false;
+  std::size_t bias_count_ = 0;
+  Eigen::Matrix<double, 6, 1> bias_sum_ = Eigen::Matrix<double, 6, 1>::Zero();
+  rmw_request_id_t bias_request_id_{};
+  rclcpp::TimerBase::SharedPtr bias_timer_;
 
   // Frames of reference
 
