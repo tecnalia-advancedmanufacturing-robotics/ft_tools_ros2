@@ -19,6 +19,7 @@
   <depend>tf2_eigen</depend>
   <depend>tf2_eigen_kdl</depend>
   <depend>kinematics_interface</depend>
+  <depend>kinematics_interface_kdl</depend>
   <depend>kdl_parser</depend>
   <depend>pluginlib</depend>
   <depend>realtime_tools</depend>
